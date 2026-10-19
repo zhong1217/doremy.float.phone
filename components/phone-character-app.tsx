@@ -13,8 +13,7 @@ import {
   loadBackgroundItems,
   saveBackgroundItems,
   type CharacterImportData,
-
-  CHAR_BLOCKED_FIELDS,
+  type CharacterImportInfo,
 } from "@/lib/character-storage";
 import { generateBriefPersonaText, isBriefPersonaStale } from "@/lib/brief-persona";
 import { generateSupportingCharacters, materializeSupportingCharacter, type GeneratedSupportingCharacter } from "@/lib/npc-generator";
@@ -925,19 +924,34 @@ function CharListView({
 
   async function handleImportFile(file: File) {
     const styleIdx = pendingStyleRef.current;
+    // 导入器会把开场白 / 场景 / 示例对话并入人设，并告知卡内是否带世界书
+    const mergedLabels: string[] = [];
+    let hasCharacterBook = false;
+    const onInfo = (info: CharacterImportInfo) => {
+      for (const label of info.mergedFields) {
+        if (!mergedLabels.includes(label)) mergedLabels.push(label);
+      }
+      if (info.hasCharacterBook) hasCharacterBook = true;
+    };
+    const placementNotice = () => {
+      const notes: string[] = ["点击画布放置角色"];
+      if (mergedLabels.length > 0) notes.push(`已把${mergedLabels.join("、")}并入人设`);
+      if (hasCharacterBook) notes.push("卡内世界书请到「设置 → 世界书」单独导入");
+      onNotice(notes.join(" · "));
+    };
     try {
       if (file.type === "application/json" || file.name.endsWith(".json")) {
         const text = await file.text();
-        const data = parseCharacterFromJson(text);
+        const data = parseCharacterFromJson(text, onInfo);
         if (!data) return onNotice("解析失败，请检查文件格式");
         const c = createCharacter(data);
         c.polaroidStyle = styleIdx;
         onStartCharPlacement(c);
-        onNotice("点击画布放置角色");
+        placementNotice();
       } else if (file.type === "image/png" || file.name.endsWith(".png")) {
         const buffer = await file.arrayBuffer();
-        const data = parseCharacterFromPng(buffer);
-        if (!data) return onNotice("未在 PNG 中找到角色数据");
+        const data = await parseCharacterFromPng(buffer, onInfo);
+        if (!data) return onNotice("未在 PNG 中找到角色数据（支持本应用导出卡、酒馆 v2/v3 卡图）");
         let avatar = "";
         try {
           avatar = await fileToDataUrl(file);
@@ -950,16 +964,13 @@ function CharListView({
         const c = createCharacter({ ...data, avatar });
         c.polaroidStyle = styleIdx;
         onStartCharPlacement(c);
-        onNotice("点击画布放置角色");
+        placementNotice();
       } else {
         onNotice("请选择 .json 或 .png 文件");
       }
     } catch (e) {
-      if (e instanceof Error && e.message === CHAR_BLOCKED_FIELDS) {
-        setImportError("不支持包含开场白、场景或示例对话的角色卡");
-      } else {
-        onNotice("解析失败，请检查文件格式");
-      }
+      console.error("Character import failed", e);
+      onNotice("解析失败，请检查文件格式");
     }
   }
 

@@ -2,19 +2,35 @@ import type { Character, CanvasBgItem } from "./character-types";
 import { normalizeTimeZone } from "./character-time";
 import { kvGet, kvSet, registerKvMigration } from "./kv-db";
 
-/** Thrown when a character card contains fields unsupported by the current schema */
+/** 历史兼容：早期版本用这个错误码整卡拒绝导入，现在已改为并入人设，外部可按需识别 */
 export const CHAR_BLOCKED_FIELDS = "CHAR_BLOCKED_FIELDS";
 
 const STORAGE_KEY = "ai_phone_characters_v1";
 const BG_ITEMS_STORAGE_KEY = "ai_phone_bg_items_v1";
 export const CHARACTERS_UPDATED_EVENT = "characters-updated";
-const UNSUPPORTED_CHARACTER_IMPORT_FIELDS = [
-  "greeting",
-  "first_mes",
-  "alternate_greetings",
-  "mes_example",
-  "scenario",
-] as const;
+
+/**
+ * 酒馆角色卡（chara_card_v2 / v3）里本产品没有独立字段的项。
+ *
+ * 这套产品是「人设 + 主动消息」模型，Character 里没有开场白 / 场景 / 示例对话的位置，
+ * 但它们是唯一能塑造角色言行的正文素材，直接丢弃太浪费：
+ * 导入时统一并入 persona（persona 是唯一会被注入提示词的角色正文）。
+ * 卡内世界书（character_book）不在此列，需用户到「设置 → 世界书」单独导入。
+ */
+const SOFT_IMPORT_FIELD_LABELS: ReadonlyArray<{ keys: readonly string[]; label: string }> = [
+  { keys: ["scenario"], label: "场景设定" },
+  { keys: ["mes_example"], label: "示例对话" },
+  { keys: ["first_mes", "greeting"], label: "开场白" },
+  { keys: ["alternate_greetings"], label: "备选开场白" },
+];
+
+/** 导入时回传给 UI 的补充信息 */
+export type CharacterImportInfo = {
+  /** 被并入 persona 的字段中文名，如 ["场景设定", "示例对话"] */
+  mergedFields: string[];
+  /** 卡内是否带世界书（需到「设置 → 世界书」单独导入） */
+  hasCharacterBook: boolean;
+};
 registerKvMigration(STORAGE_KEY);
 registerKvMigration(BG_ITEMS_STORAGE_KEY);
 
@@ -167,8 +183,44 @@ export type CharacterImportData = Omit<
   "id" | "createdAt" | "updatedAt"
 >;
 
+/** 把卡里的字符串 / 字符串数组统一取成一段文本 */
+function extractCardText(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => (typeof item === "string" ? item.trim() : ""))
+      .filter(Boolean)
+      .join("\n\n---\n\n");
+  }
+  return "";
+}
+
+/** 把开场白 / 场景 / 示例对话并入人设，返回新的人设与已并入的字段名 */
+function mergeCardExtras(
+  persona: string,
+  src: Record<string, unknown>,
+  obj: Record<string, unknown>
+): { persona: string; merged: string[] } {
+  const parts: string[] = [];
+  const merged: string[] = [];
+  for (const { keys, label } of SOFT_IMPORT_FIELD_LABELS) {
+    const pieces: string[] = [];
+    for (const key of keys) {
+      const text = extractCardText(src[key] ?? obj[key]);
+      if (text) pieces.push(text);
+    }
+    if (pieces.length === 0) continue;
+    parts.push(`【${label}】\n${pieces.join("\n\n")}`);
+    if (!merged.includes(label)) merged.push(label);
+  }
+  if (parts.length === 0) return { persona, merged };
+  const head = persona.trim();
+  return { persona: head ? `${head}\n\n${parts.join("\n\n")}` : parts.join("\n\n"), merged };
+}
+
 export function parseCharacterFromJson(
-  text: string
+  text: string,
+  onInfo?: (info: CharacterImportInfo) => void
 ): CharacterImportData | null {
   try {
     const obj = JSON.parse(text) as Record<string, unknown>;
@@ -182,13 +234,17 @@ export function parseCharacterFromJson(
       return null;
     }
 
-    const src = (obj.schema === "ai_phone_character" && typeof obj.data === "object" && obj.data !== null)
+    // 本 App 自家格式：{ schema: "ai_phone_character", data }；
+    // 酒馆 chara_card_v2 / v3：{ spec: "chara_card_v2", data }；
+    // 老格式：字段直接摊在顶层。三种都要认，否则 v2 卡的 name/description 读不到。
+    const dataLayer = obj.data && typeof obj.data === "object" && obj.data !== null
       ? obj.data as Record<string, unknown>
-      : obj;
-
-    if (UNSUPPORTED_CHARACTER_IMPORT_FIELDS.some((field) => field in src || field in obj)) {
-      throw new Error(CHAR_BLOCKED_FIELDS);
-    }
+      : null;
+    const looksWrapped =
+      obj.schema === "ai_phone_character" ||
+      (typeof obj.spec === "string" && /^chara_card/i.test(obj.spec)) ||
+      Boolean(dataLayer && !obj.name && !obj.description);
+    const src = (looksWrapped && dataLayer) ? dataLayer : obj;
 
     const polaroidStyle = typeof src.polaroidStyle === "number" && Number.isFinite(src.polaroidStyle)
       ? Math.max(0, Math.min(4, Math.round(src.polaroidStyle)))
@@ -206,9 +262,13 @@ export function parseCharacterFromJson(
       ? Math.max(1, Math.min(3, src.polaroidImageZoom))
       : undefined;
 
+    const { persona, merged } = mergeCardExtras(String(src.description ?? src.persona ?? ""), src, obj);
+    const hasCharacterBook = Boolean(src.character_book ?? obj.character_book);
+    onInfo?.({ mergedFields: merged, hasCharacterBook });
+
     return {
       name: String(src.name ?? ""),
-      persona: String(src.description ?? src.persona ?? ""),
+      persona,
       avatar: validAvatar(src.avatar),
       personality: typeof src.personality === "string" && src.personality.trim() ? src.personality : undefined,
       tags: Array.isArray(src.tags) ? src.tags.map(String) : [],
@@ -220,15 +280,39 @@ export function parseCharacterFromJson(
       polaroidImageY,
       polaroidImageZoom,
     };
-  } catch (e) {
-    if (e instanceof Error && e.message === CHAR_BLOCKED_FIELDS) throw e;
+  } catch {
     return null;
   }
 }
 
 // ── PNG import/export ────────────────────────────────
 
-function readPngTextChunk(u8: Uint8Array, keyword: string): string | null {
+/** base64 → UTF-8 文本（酒馆的 chara / ccv3 块就是 base64 的 JSON） */
+function decodeBase64Utf8(b64: string): string | null {
+  try {
+    const bin = atob(b64.trim());
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/** zlib(deflate) 解压，用于 PNG 的 zTXt 文本块；环境不支持时返回 null */
+async function inflateZlib(data: Uint8Array): Promise<Uint8Array | null> {
+  if (typeof DecompressionStream === "undefined") return null;
+  try {
+    const stream = new Blob([data as unknown as BlobPart])
+      .stream()
+      .pipeThrough(new DecompressionStream("deflate"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+async function readPngTextChunk(u8: Uint8Array, keyword: string): Promise<string | null> {
   const sig = [137, 80, 78, 71, 13, 10, 26, 10];
   for (let i = 0; i < 8; i++) {
     if (u8[i] !== sig[i]) return null;
@@ -278,6 +362,22 @@ function readPngTextChunk(u8: Uint8Array, keyword: string): string | null {
         if (compressionFlag === 0) {
           return new TextDecoder().decode(data.subarray(pos));
         }
+        const inflated = await inflateZlib(data.subarray(pos));
+        if (inflated) return new TextDecoder().decode(inflated);
+      }
+    } else if (type === "zTXt") {
+      // zTXt: keyword\0 <压缩方法 1 字节> <zlib 压缩文本>
+      const data = u8.subarray(offset + 8, offset + 8 + length);
+      let sep = -1;
+      for (let i = 0; i < data.length; i++) {
+        if (data[i] === 0) { sep = i; break; }
+      }
+      if (sep >= 0) {
+        const kw = new TextDecoder().decode(data.subarray(0, sep));
+        if (kw === keyword) {
+          const inflated = await inflateZlib(data.subarray(sep + 2));
+          if (inflated) return new TextDecoder().decode(inflated);
+        }
       }
     }
 
@@ -287,20 +387,43 @@ function readPngTextChunk(u8: Uint8Array, keyword: string): string | null {
   return null;
 }
 
-export function parseCharacterFromPng(
-  buffer: ArrayBuffer
-): CharacterImportData | null {
+/**
+ * 从 PNG 卡图里读角色数据。支持两类：
+ * ① 本 App 自己导出的卡：私有块 ai_phone_character（URL 编码的 JSON）；
+ * ② 酒馆（SillyTavern）卡图：v3 的 ccv3 块、v2 的 chara 块（base64 的 JSON），
+ *    压缩存储的 zTXt 块也能解。
+ */
+export async function parseCharacterFromPng(
+  buffer: ArrayBuffer,
+  onInfo?: (info: CharacterImportInfo) => void
+): Promise<CharacterImportData | null> {
   const u8 = new Uint8Array(buffer);
-  const charaBase64 = readPngTextChunk(u8, "ai_phone_character");
-  if (!charaBase64) return null;
 
-  try {
-    const jsonStr = decodeURIComponent(escape(atob(charaBase64)));
-    return parseCharacterFromJson(jsonStr);
-  } catch (e) {
-    if (e instanceof Error && e.message === CHAR_BLOCKED_FIELDS) throw e;
-    return null;
+  // ① 本 App 自家格式
+  const own = await readPngTextChunk(u8, "ai_phone_character");
+  if (own) {
+    try {
+      return parseCharacterFromJson(decodeURIComponent(escape(atob(own))), onInfo);
+    } catch {
+      return null;
+    }
   }
+
+  // ② 酒馆卡图：v3 优先，其次 v2
+  for (const keyword of ["ccv3", "chara"]) {
+    const raw = await readPngTextChunk(u8, keyword);
+    if (!raw) continue;
+    const json = decodeBase64Utf8(raw);
+    if (!json) continue;
+    try {
+      const data = parseCharacterFromJson(json, onInfo);
+      if (data) return data;
+    } catch {
+      // 换下一个关键词继续尝试
+    }
+  }
+
+  return null;
 }
 
 // ── CRC32 ────────────────────────────────────────────
